@@ -3,6 +3,10 @@
 Stop Android Auto when the car is off, bring it back when the car wakes up — using a signal the
 kernel already publishes. **No GPIO, no resistors, no cut USB cable, no extra hardware.**
 
+> **Tested on:** Hyundai Kona EV 2021 with a Gen5W head unit (Mobis `standard_m_5`, software
+> `V014.010.250818`, Android Auto protocol 1.4), running on an AAWireless Two. One car, one board —
+> see [Status and caveats](#status-and-caveats).
+
 Companion script for [aa-proxy-rs](https://github.com/aa-proxy/aa-proxy-rs). Plain POSIX shell,
 runs on BusyBox.
 
@@ -89,7 +93,7 @@ inert and only the USB rule acts.
 
 ## Measured timings
 
-Hyundai Kona EV 2021 (Mobis `standard_m_5`), AAWireless Two. **Starting points, not gospel** —
+Hyundai Kona EV 2021, Gen5W head unit, AAWireless Two. **Starting points, not gospel** —
 measure your own.
 
 | Event | Observed |
@@ -101,15 +105,31 @@ measure your own.
 
 ## Configuration
 
-Edit the constants at the top of `aa-standby`:
+Nothing in the script needs editing. Drop a `/etc/aa-standby.conf` next to it and override only
+what you need — see [`aa-standby.conf.example`](aa-standby.conf.example):
 
-| Constant | Notes |
+```sh
+USB_OFF=30
+VGATE=aa:bb:cc:dd:ee:ff
+```
+
+The USB paths are **auto-detected**: the script takes the single entry under `/sys/class/udc/` and
+`/sys/class/extcon/`, which is right on most boards. Override `UDC_STATE` / `EXTCON_STATE` only if
+`ls /sys/class/udc/` shows more than one. The resolved paths are printed in the log at startup:
+
+```
+chemins : udc=/sys/class/udc/ffb00000.usb/state extcon=/sys/class/extcon/extcon0/state ...
+```
+
+| Setting | Notes |
 |---|---|
-| `UDC_STATE` | **board-specific.** Check `ls /sys/class/udc/` — there is usually exactly one entry |
-| `EXTCON_STATE` | check `ls /sys/class/extcon/` |
-| `VGATE` | MAC of your Bluetooth OBD dongle; leave as-is if you have none |
+| `USB_OFF` | USB detached this long ⇒ head unit is off (default 25 s) |
+| `BOOT_GRACE` | grace after start, since the USB takes 22–28 s to attach at boot (35 s) |
+| `FALSE_OFF` | slept on an OBD criterion but the USB never dropped ⇒ we were wrong, wake up (240 s) |
+| `OFF_AFTER` | slow net: no OBD data at all (90 s) |
+| `FOCUS_CONFIRM` | screen handed back to the car + OBD silence; needs the WASM hook (25 s) |
+| `VGATE` | MAC of your Bluetooth OBD dongle; leave alone if you have none |
 | `INIT` | your `aa-proxy-rs` init script |
-| `USB_OFF`, `BOOT_GRACE`, `FALSE_OFF`, `OFF_AFTER`, `FOCUS_CONFIRM` | see timings above |
 
 Mode lives in `/data/aa-standby.mode`:
 
@@ -145,7 +165,8 @@ rules. On the car above, the USB rule alone is what does the real work.
 
 ## Status and caveats
 
-Young. Developed and measured on **one car and one board**. Treat it as a working reference
+Young. Developed and measured on **one car and one board** — a Hyundai Kona EV 2021 with a Gen5W
+head unit, on an AAWireless Two. Other head units may detach the USB differently, or not at all. Treat it as a working reference
 implementation of the idea, not a finished product.
 
 Known limits:

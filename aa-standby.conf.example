@@ -1,0 +1,22 @@
+# /etc/aa-standby.conf — surcharge les constantes d'aa-standby sans modifier le script.
+# Copier vers /etc/aa-standby.conf et ne garder que les lignes utiles.
+
+# Contrôleur USB. Laisser commenté : le script prend la seule entrée présente, ce qui suffit
+# presque toujours. À forcer seulement si `ls /sys/class/udc/` en montre plusieurs.
+#UDC_STATE=/sys/class/udc/fe980000.usb/state
+#EXTCON_STATE=/sys/class/extcon/extcon0/state
+
+# Script d'init d'aa-proxy-rs, qu'aa-standby arrête et relance.
+#INIT=/etc/init.d/S93aa-proxy-rs
+
+# MAC du dongle OBD Bluetooth. Sans dongle, laisser tel quel : toutes les règles OBD
+# resteront inertes et seule la règle USB agira.
+#VGATE=00:00:00:00:00:00
+
+# Délais, en secondes. Voir le tableau des mesures dans le README avant de les baisser.
+#USB_OFF=25         # USB détaché pendant ce temps => autoradio hors tension
+#BOOT_GRACE=35      # grâce au lancement (l'USB met 22-28 s à s'attacher au boot)
+#FALSE_OFF=240      # veille sur critère OBD sans chute de l'USB => on s'est trompé, on rallume
+#OFF_AFTER=90       # filet lent : plus aucune donnée OBD
+#FOCUS_CONFIRM=25   # écran rendu à la voiture + silence OBD (nécessite le hook WASM)
+#LOOP=2             # période de la boucle

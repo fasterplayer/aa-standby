@@ -1,5 +1,5 @@
 #!/bin/sh
-# aa-standby v4.1 — coupe Android Auto quand la voiture est éteinte, le remet quand elle redémarre.
+# aa-standby v4.2 — coupe Android Auto quand la voiture est éteinte, le remet quand elle redémarre.
 #
 # SIGNAL PRINCIPAL : l'état du gadget USB (/sys/class/udc/.../state).
 #   Il suit l'alimentation de l'autoradio, ne dépend ni du Vgate ni du Bluetooth, et il survit à
@@ -54,6 +54,15 @@ PROBE_SECS=20      # durée max de la sonde OBD de confirmation
 COOLDOWN=300       # s sans ping Vgate après un faux réveil
 HEARTBEAT=1800
 LOOP=2
+
+# --- reglages locaux, sans toucher à ce fichier ---------------------------------------------
+# /etc/aa-standby.conf peut redefinir n'importe laquelle des constantes ci-dessus.
+[ -r /etc/aa-standby.conf ] && . /etc/aa-standby.conf
+
+# Le nom du contrôleur USB depend de la carte (ffb00000.usb, fe980000.usb...). Si le chemin
+# configuré n'existe pas, on prend la seule entrée présente, ce qui marche sur la plupart des cartes.
+[ -r "$UDC_STATE" ]    || UDC_STATE=$(ls -d /sys/class/udc/*/state 2>/dev/null | head -1)
+[ -r "$EXTCON_STATE" ] || EXTCON_STATE=$(ls -d /sys/class/extcon/*/state 2>/dev/null | head -1)
 
 [ -r "$MODE_FILE" ] && MODE=$(cat "$MODE_FILE")
 [ "$MODE" = reel ] || MODE=observation
@@ -159,7 +168,8 @@ vg=inconnu
 # Filet : quoi qu'il arrive en sortant, Android Auto redémarre.
 trap 'log "arrêt du script -> relance Android Auto"; SAVE=$MODE; MODE=reel; start_aa; MODE=$SAVE; exit 0' INT TERM
 
-log "=== démarrage aa-standby v4.1 MODE=$MODE (usb_off=${USB_OFF}s boot_grace=${BOOT_GRACE}s off_after=${OFF_AFTER}s focus_confirm=${FOCUS_CONFIRM}s probe=${PROBE_SECS}s cooldown=${COOLDOWN}s false_off=${FALSE_OFF}s)"
+log "=== démarrage aa-standby v4.2 MODE=$MODE (usb_off=${USB_OFF}s boot_grace=${BOOT_GRACE}s off_after=${OFF_AFTER}s focus_confirm=${FOCUS_CONFIRM}s probe=${PROBE_SECS}s cooldown=${COOLDOWN}s false_off=${FALSE_OFF}s)"
+log "chemins : udc=$UDC_STATE extcon=$EXTCON_STATE init=$INIT"
 
 if [ "$prev_udc" = configured ]; then
     # L'autoradio est déjà là : démarrage normal.
