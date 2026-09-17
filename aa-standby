@@ -1,0 +1,360 @@
+#!/bin/sh
+# aa-standby v4.1 — coupe Android Auto quand la voiture est éteinte, le remet quand elle redémarre.
+#
+# SIGNAL PRINCIPAL : l'état du gadget USB (/sys/class/udc/.../state).
+#   Il suit l'alimentation de l'autoradio, ne dépend ni du Vgate ni du Bluetooth, et il survit à
+#   l'arrêt d'aa-proxy-rs (vérifié le 2026-09-17 : le gadget reste attaché ; seul un *démarrage*
+#   d'aa-proxy-rs le reconstruit). C'est donc le seul signal utilisable pour le réveil en mode réel.
+#
+# DÉTECTION DE L'EXTINCTION (trois critères, du plus fiable au plus rapide) :
+#   - USB de l'écran détaché depuis USB_OFF s  -> veille. Ne dépend pas de l'OBD, donc marche
+#     aussi sans adaptateur OBD et quand le boîtier démarre voiture déjà éteinte.
+#   - écran rendu à la voiture (focus natif) + silence OBD >= FOCUS_CONFIRM s -> veille (~25 s).
+#     Si les données OBD continuent, c'est juste un passage à la radio : on ne coupe rien.
+#   - filet lent : plus aucune donnée OBD depuis OFF_AFTER s -> veille (~90 s).
+#
+# DÉTECTION DU RÉVEIL :
+#   - l'USB de l'écran retombe puis revient -> réveil immédiat (< 2 s), sans Bluetooth ;
+#   - filet : le Vgate redevient joignable ET une sonde OBD confirme. Attention, le l2ping seul
+#     ne prouve RIEN : mesuré le 2026-09-17, le Vgate reste joignable voiture éteinte (5 faux
+#     réveils sur 5). Seule la sonde OBD tranche.
+#
+# SÉCURITÉS :
+#   - au démarrage, Android Auto n'est lancé QUE si l'USB de l'écran est attaché (autoradio sous
+#     tension). Sinon on part en VEILLE : inutile de solliciter le téléphone quand la voiture est
+#     éteinte. Failsafe : si le gadget USB n'apparaît jamais, on lance Android Auto quand même ;
+#   - en état ACTIF, si aa-proxy-rs meurt (plantage), il est relancé ;
+#   - si on s'endort sur un critère OBD mais que l'USB ne tombe jamais dans les FALSE_OFF s, c'est
+#     qu'on s'est trompé (Vgate mort en roulant) : on rallume et on cesse de croire l'OBD ;
+#   - si le script est arrêté (kill), Android Auto est relancé avant de quitter.
+#
+# MODE : contenu de /data/aa-standby.mode -> "observation" (journalise seulement) ou "reel".
+
+MODE=observation
+
+LOG=/data/aa-standby.log
+MODE_FILE=/data/aa-standby.mode
+OBDLOG=/var/log/aa-proxy-obd.log
+RSLOG=/var/log/aa-proxy-rs.log
+PROBE_TOML=/tmp/aa-standby-probe.toml
+PROBE_LOG=/tmp/aa-standby-probe.log
+INIT=/etc/init.d/S93aa-proxy-rs
+VGATE=00:00:00:00:00:00   # MAC de votre dongle OBD Bluetooth (voir README)
+UDC_STATE=/sys/class/udc/ffb00000.usb/state
+# VBUS vu par le PHY USB. Contrairement a UDC_STATE, ne depend pas du gadget USB : il survit
+# donc a un arret d'aa-proxy-rs. Dit si la voiture alimente encore le boitier.
+EXTCON_STATE=/sys/class/extcon/extcon0/state
+
+OFF_AFTER=90       # s sans données OBD => voiture éteinte (filet)
+FOCUS_CONFIRM=25   # s sans données OBD après « la voiture reprend l'écran » => voiture éteinte
+BOOT_GRACE=35      # s de grâce au lancement avant d'appliquer la règle USB (USB attaché a 22-28 s)
+FALSE_OFF=240      # s en veille sans que l'USB tombe => on s'est trompé, on rallume (failsafe)
+USB_OFF=25         # s avec l'USB de l'écran détaché => autoradio hors tension => voiture éteinte
+PROBE_SECS=20      # durée max de la sonde OBD de confirmation
+COOLDOWN=300       # s sans ping Vgate après un faux réveil
+HEARTBEAT=1800
+LOOP=2
+
+[ -r "$MODE_FILE" ] && MODE=$(cat "$MODE_FILE")
+[ "$MODE" = reel ] || MODE=observation
+
+up() { cut -d. -f1 /proc/uptime; }
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') up=$(up)s [$state] $*" >> "$LOG"
+    if [ "$(wc -c < "$LOG")" -gt 1048576 ]; then
+        mv "$LOG" "$LOG.1"
+    fi
+}
+
+rs_running() { [ -n "$(pidof aa-proxy-rs)" ]; }
+
+obd_alive() {
+    for p in $(pidof aa-proxy-obd); do
+        grep -q 'State:.*Z' /proc/$p/status 2>/dev/null || return 0
+    done
+    return 1
+}
+
+start_aa() {
+    if [ "$MODE" = reel ]; then
+        rs_running || "$INIT" start >/dev/null 2>&1
+    fi
+}
+
+stop_aa() {
+    if [ "$MODE" = reel ]; then
+        "$INIT" stop >/dev/null 2>&1
+        sleep 2
+        for p in $(pidof aa-proxy-obd); do kill "$p" 2>/dev/null; done
+    fi
+}
+
+count_lines() {
+    c=$(grep -c "$2" "$1" 2>/dev/null)
+    [ -z "$c" ] && c=0
+    echo "$c"
+}
+
+data_count() { count_lines "$OBDLOG" 'battery_level_percentage:'; }
+# Le hook WASM hu-observe écrit une ligne par changement de focus vidéo.
+# 1 = Android Auto est à l'écran, 2 = la voiture a repris l'écran (radio, menus, ou extinction).
+focus_mode() {
+    m=$(sed 's/\x1b\[[0-9;]*m//g' "$RSLOG" 2>/dev/null | grep -o 'VIDEO_FOCUS mode=[0-9]' | tail -1 | cut -d= -f2)
+    [ -z "$m" ] && m=0
+    echo "$m"
+}
+
+udc_state() { cat "$UDC_STATE" 2>/dev/null || echo inconnu; }
+
+# 1 = la voiture alimente le port USB, 0 = plus de courant (le boitier va tomber).
+vbus_state() {
+    v=$(grep "^USB=" "$EXTCON_STATE" 2>/dev/null | cut -d= -f2)
+    [ -z "$v" ] && v=inconnu
+    echo "$v"
+}
+
+# Le gadget USB est-il attaché au contrôleur ? Sert à ne pas tuer aa-proxy-rs pendant qu'il le
+# construit au démarrage.
+gadget_bound() { [ -n "$(cat /sys/kernel/config/usb_gadget/accessory/UDC 2>/dev/null)" ]; }
+
+vgate_reachable() { l2ping -c 1 -t 2 "$VGATE" >/dev/null 2>&1; }
+
+# Sonde OBD courte : confirme que la voiture répond vraiment.
+probe_obd() {
+    rm -f "$PROBE_LOG"
+    aa-proxy-obd -c "$PROBE_TOML" >/dev/null 2>&1 &
+    pp=$!
+    i=0
+    while [ "$i" -lt "$PROBE_SECS" ]; do
+        grep -q 'battery_level_percentage:' "$PROBE_LOG" 2>/dev/null && break
+        sleep 1
+        i=$((i + 1))
+    done
+    kill "$pp" 2>/dev/null
+    sleep 1
+    kill -9 "$pp" 2>/dev/null
+    wait "$pp" 2>/dev/null
+    grep -q 'battery_level_percentage:' "$PROBE_LOG" 2>/dev/null
+}
+
+sed -e 's#^log_file .*#log_file = "/tmp/aa-standby-probe.log"#' /etc/aa-proxy-obd.toml > "$PROBE_TOML"
+
+state=ACTIF
+now=$(up)
+prev_data=$(data_count)
+prev_udc=$(udc_state)
+prev_vbus=$(vbus_state)
+last_data=$now
+prev_focus=$(focus_mode)
+seen_data=0
+last_usb_ok=$now
+start_ts=$now
+usb_dropped=0
+veille_ts=$now
+cooldown_until=0
+last_hb=$now
+vg=inconnu
+
+# Filet : quoi qu'il arrive en sortant, Android Auto redémarre.
+trap 'log "arrêt du script -> relance Android Auto"; SAVE=$MODE; MODE=reel; start_aa; MODE=$SAVE; exit 0' INT TERM
+
+log "=== démarrage aa-standby v4.1 MODE=$MODE (usb_off=${USB_OFF}s boot_grace=${BOOT_GRACE}s off_after=${OFF_AFTER}s focus_confirm=${FOCUS_CONFIRM}s probe=${PROBE_SECS}s cooldown=${COOLDOWN}s false_off=${FALSE_OFF}s)"
+
+if [ "$prev_udc" = configured ]; then
+    # L'autoradio est déjà là : démarrage normal.
+    start_aa
+    rs_running && log "aa-proxy-rs actif au démarrage (usb=$prev_udc vbus=$prev_vbus)" || log "aa-proxy-rs NON actif au démarrage (usb=$prev_udc vbus=$prev_vbus)"
+else
+    # L'autoradio n'est pas alimenté. On ne lance PAS Android Auto : sinon le boîtier sollicite le
+    # téléphone pendant toute la fenêtre de grâce, ce qui est exactement ce que l'utilisateur
+    # voulait supprimer (choix « option B » du 2026-09-17).
+    #
+    # PRUDENCE : S93 vient de lancer aa-proxy-rs, qui est en train de (re)construire le gadget USB.
+    # Le tuer en plein milieu laisserait un gadget incomplet et l'autoradio ne pourrait plus jamais
+    # s'énumérer — Android Auto serait mort jusqu'au prochain reboot. On attend donc que le gadget
+    # soit attaché avant de couper. Si l'USB s'attache entre-temps, c'est que la voiture est
+    # allumée et on reste ACTIF.
+    log "USB de l'écran non attaché au démarrage (vbus=$prev_vbus) — on attend le gadget avant de décider"
+    i=0
+    while [ "$i" -lt 25 ]; do
+        u=$(udc_state)
+        [ "$u" = configured ] && break
+        gadget_bound && break
+        sleep 1
+        i=$((i + 1))
+    done
+    prev_udc=$(udc_state)
+
+    if [ "$prev_udc" = configured ]; then
+        last_usb_ok=$(up)
+        start_aa
+        log "USB attaché pendant l'attente (${i}s) -> voiture allumée -> ACTIF"
+    elif gadget_bound; then
+        state=VEILLE
+        usb_dropped=1
+        veille_ts=$(up)
+        log "autoradio hors tension -> Android Auto NON lancé, VEILLE (gadget prêt après ${i}s)"
+        stop_aa
+    else
+        # Le gadget n'est jamais apparu : on ne touche à rien. Failsafe — mieux vaut un boîtier
+        # qui sollicite le téléphone qu'un boîtier incapable de démarrer Android Auto.
+        start_aa
+        log "gadget USB absent après ${i}s -> on laisse Android Auto tourner (failsafe)"
+    fi
+fi
+
+while true; do
+    now=$(up)
+
+    # --- données OBD ---
+    c=$(data_count)
+    [ "$c" -lt "$prev_data" ] && prev_data=0
+    if [ "$c" -gt "$prev_data" ]; then
+        [ "$seen_data" -eq 0 ] && log "premières données OBD reçues"
+        last_data=$now
+        seen_data=1
+        prev_data=$c
+    fi
+
+    # --- qui a l'écran en ce moment ? ---
+    f=$(focus_mode)
+    if [ "$f" != "$prev_focus" ]; then
+        case "$f" in
+            1) log "Android Auto a repris l'écran (focus projection)" ;;
+            2) log "la voiture a repris l'écran (focus natif) — extinction, radio ou menus" ;;
+        esac
+        prev_focus=$f
+    fi
+
+    # --- état de la liaison USB avec l'écran ---
+    u=$(udc_state)
+    if [ "$u" != "$prev_udc" ]; then
+        log "USB écran : $prev_udc -> $u"
+        prev_udc_before=$prev_udc
+        prev_udc=$u
+    else
+        prev_udc_before=""
+    fi
+
+    # --- la voiture alimente-t-elle encore le boitier ? ---
+    v=$(vbus_state)
+    if [ "$v" != "$prev_vbus" ]; then
+        log "alimentation USB (VBUS) : $prev_vbus -> $v"
+        prev_vbus=$v
+    fi
+
+    # L'USB de l'écran est le signal le plus fiable : il suit l'alimentation de l'autoradio,
+    # il ne dépend ni du Vgate ni du Bluetooth, et il survit à l'arrêt d'aa-proxy-rs (vérifié
+    # le 2026-09-17 : le gadget reste attaché, seul un *démarrage* d'aa-proxy-rs le reconstruit).
+    [ "$u" = configured ] && last_usb_ok=$now
+
+    case "$state" in
+        ACTIF)
+            # Filet : aa-proxy-rs a planté pendant qu'on roule.
+            if ! rs_running; then
+                log "aa-proxy-rs absent alors qu'on est ACTIF -> relance"
+                SAVE=$MODE; MODE=reel; start_aa; MODE=$SAVE
+                last_usb_ok=$(up)   # le redémarrage détache l'USB quelques secondes : on l'ignore
+            fi
+
+            silence=$((now - last_data))
+            usb_off=$((now - last_usb_ok))
+            reason=""
+            # Grâce de BOOT_GRACE après le lancement : au boot l'USB met 22 à 28 s à s'attacher, on ne
+            # veut pas conclure « voiture éteinte » pendant cette fenêtre.
+            if [ "$usb_off" -ge "$USB_OFF" ] && [ $((now - start_ts)) -ge "$BOOT_GRACE" ]; then
+                # Ne dépend pas de seen_data : couvre le cas d'un boîtier démarré voiture éteinte,
+                # où aucune donnée OBD n'arrive jamais et où l'ancienne logique restait ACTIF
+                # indéfiniment.
+                reason="USB de l'écran détaché depuis ${usb_off}s (autoradio hors tension)"
+            elif [ "$seen_data" -eq 1 ] && [ "$silence" -gt "$OFF_AFTER" ]; then
+                reason="pas de données OBD depuis ${silence}s"
+            elif [ "$seen_data" -eq 1 ] && [ "$f" = 2 ] && [ "$silence" -ge "$FOCUS_CONFIRM" ]; then
+                # L'écran appartient à la voiture ET l'OBD s'est tu : extinction très probable.
+                # Si Android Auto était à l'écran (focus 1), on préfère attendre le filet lent :
+                # un OBD muet vient plus souvent d'un Vgate capricieux que d'une extinction.
+                reason="écran à la voiture + aucune donnée OBD depuis ${silence}s (détection rapide)"
+            fi
+
+            if [ -n "$reason" ]; then
+                state=VEILLE
+                vg=inconnu
+                cooldown_until=0
+                usb_dropped=0
+                veille_ts=$now
+                log "voiture éteinte ($reason) -> VEILLE"
+                stop_aa
+            fi
+            ;;
+
+        VEILLE)
+            # L'USB peut mettre jusqu'à ~3 min à se détacher après l'extinction (mesuré), donc on
+            # exige de l'avoir vu tomber avant de traiter son retour comme un rallumage. Sans ça,
+            # une veille déclenchée par le focus serait annulée dans la seconde.
+            [ "$u" != configured ] && usb_dropped=1
+
+            # 1) Failsafe : on s'est endormi sur un critère OBD alors que l'écran était encore
+            # alimenté, et l'USB n'est jamais tombé. Donc la voiture ne s'était pas éteinte —
+            # c'est le Vgate qui a lâché en roulant. On rallume plutôt que de laisser Android
+            # Auto coupé tout le trajet. seen_data repasse à 0 : on ne refait plus confiance à
+            # l'OBD pour endormir tant qu'il n'a pas redonné signe de vie (sinon on boucle).
+            if [ "$usb_dropped" -eq 0 ] && [ $((now - veille_ts)) -ge "$FALSE_OFF" ]; then
+                state=ACTIF
+                last_data=$now
+                last_usb_ok=$now
+                seen_data=0
+                log "faux positif : USB de l'écran jamais tombé après ${FALSE_OFF}s -> ACTIF"
+                start_aa
+
+            # 2) l'USB de l'écran retombe puis revient : la voiture s'est rallumée. Réveil immédiat,
+            #    sans Bluetooth, sans sonde, sans toucher à la batterie.
+            elif [ "$usb_dropped" -eq 1 ] && [ "$u" = configured ]; then
+                state=ACTIF
+                last_data=$now
+                last_usb_ok=$now
+                log "USB de l'écran de nouveau attaché -> voiture rallumée -> ACTIF"
+                start_aa
+
+            # 3) des données OBD reviennent (cas où aa-proxy-obd tourne encore)
+            elif [ "$last_data" -eq "$now" ]; then
+                state=ACTIF
+                last_usb_ok=$now
+                log "données OBD de nouveau présentes -> ACTIF"
+                start_aa
+
+            # 4) filet lent : le Vgate répond, on confirme par une sonde OBD.
+            #    Le l2ping seul ne prouve RIEN — mesuré le 2026-09-17, le Vgate reste joignable
+            #    voiture éteinte (5 faux réveils sur 5). Seule la sonde OBD tranche.
+            elif [ "$now" -ge "$cooldown_until" ] && ! obd_alive; then
+                if vgate_reachable; then
+                    [ "$vg" != reveille ] && log "Vgate joignable -> sonde OBD (${PROBE_SECS}s max)..."
+                    vg=reveille
+                    if probe_obd; then
+                        state=ACTIF
+                        last_data=$(up)
+                        last_usb_ok=$(up)
+                        seen_data=1
+                        prev_data=$(data_count)
+                        log "voiture RALLUMÉE (confirmée par l'OBD) -> ACTIF"
+                        start_aa
+                    else
+                        cooldown_until=$(( $(up) + COOLDOWN ))
+                        vg=inconnu
+                        log "faux réveil (Vgate joignable mais pas de données OBD) -> pause ping ${COOLDOWN}s"
+                    fi
+                elif [ "$vg" != endormi ]; then
+                    vg=endormi
+                    log "Vgate injoignable (endormi)"
+                fi
+            fi
+            ;;
+    esac
+
+    if [ $((now - last_hb)) -ge "$HEARTBEAT" ]; then
+        last_hb=$now
+        log "heartbeat: mode=$MODE rs=$(rs_running && echo oui || echo non) obd=$(obd_alive && echo oui || echo non) usb=$u vbus=$v vgate=$vg"
+    fi
+
+    sleep "$LOOP"
+done

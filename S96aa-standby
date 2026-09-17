@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# Start aa-standby (coupe/relance Android Auto selon l'état de la voiture, via l'OBD)
+#
+
+DAEMON="aa-standby"
+PIDFILE="/var/run/$DAEMON.pid"
+RETVAL=0
+
+case "$1" in
+	start)
+		printf "Starting $DAEMON: "
+		start-stop-daemon -S -b -q -m -p "$PIDFILE" -x "/etc/$DAEMON"
+		RETVAL=$?
+		[ $RETVAL = 0 ] && echo "OK" || echo "FAIL"
+		;;
+	stop)
+		printf "Stopping $DAEMON: "
+		start-stop-daemon -K -q -p "$PIDFILE"
+		RETVAL=$?
+		[ $RETVAL = 0 ] && echo "OK" || echo "FAIL"
+		;;
+	restart)
+		$0 stop
+		sleep 1
+		$0 start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		;;
+esac
+
+exit $RETVAL
