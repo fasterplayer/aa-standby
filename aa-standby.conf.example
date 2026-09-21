@@ -5,6 +5,8 @@
 # presque toujours. À forcer seulement si `ls /sys/class/udc/` en montre plusieurs.
 #UDC_STATE=/sys/class/udc/fe980000.usb/state
 #EXTCON_STATE=/sys/class/extcon/extcon0/state
+# Gadget USB « accessory » d'aa-proxy-rs. Sert au garde-fou de démarrage et au banc d'essai.
+#GADGET_UDC=/sys/kernel/config/usb_gadget/accessory/UDC
 
 # Script d'init d'aa-proxy-rs, qu'aa-standby arrête et relance.
 #INIT=/etc/init.d/S93aa-proxy-rs
@@ -19,4 +21,6 @@
 #FALSE_OFF=240      # veille sur critère OBD sans chute de l'USB => on s'est trompé, on rallume
 #OFF_AFTER=90       # filet lent : plus aucune donnée OBD
 #FOCUS_CONFIRM=25   # écran rendu à la voiture + silence OBD (nécessite le hook WASM)
+#MIN_ACTIF=90       # après un réveil, pas de nouvel endormissement avant ce délai (anti va-et-vient)
+#VEILLE_MAX=7200    # homme mort : au-delà, on rallume Android Auto quoi qu'il arrive
 #LOOP=2             # période de la boucle

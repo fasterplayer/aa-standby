@@ -1,5 +1,5 @@
 #!/bin/sh
-# aa-standby v4.2 — coupe Android Auto quand la voiture est éteinte, le remet quand elle redémarre.
+# aa-standby v4.3 — coupe Android Auto quand la voiture est éteinte, le remet quand elle redémarre.
 #
 # SIGNAL PRINCIPAL : l'état du gadget USB (/sys/class/udc/.../state).
 #   Il suit l'alimentation de l'autoradio, ne dépend ni du Vgate ni du Bluetooth, et il survit à
@@ -28,6 +28,28 @@
 #     qu'on s'est trompé (Vgate mort en roulant) : on rallume et on cesse de croire l'OBD ;
 #   - si le script est arrêté (kill), Android Auto est relancé avant de quitter.
 #
+# v4.3 (2026-09-21) — CORRECTIF DU VA-ET-VIENT VEILLE/ACTIF.
+#   Symptôme mesuré (journal du 2026-09-21, boots 92 et 98) : au démarrage voiture allumée mais
+#   autoradio pas encore énuméré, l'OBD répond (« voiture RALLUMÉE confirmée par l'OBD ») pendant
+#   que l'USB est toujours détaché. Les deux règles se contredisent et le script bascule
+#   VEILLE -> ACTIF -> VEILLE toutes les ~36 s. Observé 5 fois en 3 minutes. En mode réel, ça
+#   ferait autant de stop/start d'aa-proxy-rs, ce qui peut laisser le gadget USB non lié et tuer
+#   Android Auto (voir le piège « /restart ne reconstruit pas le gadget »).
+#   Deux garde-fous, indépendants l'un de l'autre :
+#     1. La règle USB n'endort plus tant que l'OBD parle. Des données OBD qui arrivent prouvent
+#        que le bus de la voiture est vivant, donc qu'elle n'est pas éteinte. Si l'OBD n'a jamais
+#        rien donné (seen_data=0 — cas principal : boîtier démarré voiture éteinte, avec ou sans
+#        Vgate), le comportement est INCHANGÉ : VEILLE à 41 s comme avant.
+#     2. MIN_ACTIF : après un réveil, on ne peut pas se rendormir avant MIN_ACTIF s. Ne s'applique
+#        PAS au démarrage (actif_ts=0), donc la veille initiale reste à 41 s. Le réveil, lui,
+#        n'est jamais retardé — seul l'endormissement est freiné.
+#   Et un troisième filet, sans rapport avec le va-et-vient mais de la même famille :
+#     3. VEILLE_MAX (homme mort) : au-delà de VEILLE_MAX s de veille d'affilée, on rallume Android
+#        Auto quoi qu'il arrive. Coût si la voiture est vraiment éteinte : ~90 s toutes les 2 h.
+#        En échange, AUCUNE panne ne peut plus durer indéfiniment — la v5 du 2026-09-18 avait laissé
+#        Android Auto mort 6 h 30 faute d'un filet de ce genre. Ce filet ne fait QUE rallumer, il ne
+#        peut donc pas causer la panne qu'il rattrape.
+#
 # MODE : contenu de /data/aa-standby.mode -> "observation" (journalise seulement) ou "reel".
 
 MODE=observation
@@ -44,11 +66,16 @@ UDC_STATE=/sys/class/udc/ffb00000.usb/state
 # VBUS vu par le PHY USB. Contrairement a UDC_STATE, ne depend pas du gadget USB : il survit
 # donc a un arret d'aa-proxy-rs. Dit si la voiture alimente encore le boitier.
 EXTCON_STATE=/sys/class/extcon/extcon0/state
+# Chemin du gadget USB « accessory ». Variable (et non codé en dur) pour pouvoir être redirigé
+# par /etc/aa-standby.conf lors des tests de la machine à états.
+GADGET_UDC=/sys/kernel/config/usb_gadget/accessory/UDC
 
 OFF_AFTER=90       # s sans données OBD => voiture éteinte (filet)
 FOCUS_CONFIRM=25   # s sans données OBD après « la voiture reprend l'écran » => voiture éteinte
 BOOT_GRACE=35      # s de grâce au lancement avant d'appliquer la règle USB (USB attaché a 22-28 s)
 FALSE_OFF=240      # s en veille sans que l'USB tombe => on s'est trompé, on rallume (failsafe)
+VEILLE_MAX=7200     # s max en veille d'affilee -> on rallume par securite (filet homme mort)
+MIN_ACTIF=90        # s minimum en ACTIF apres un reveil avant de pouvoir re-endormir (anti va-et-vient)
 USB_OFF=25         # s avec l'USB de l'écran détaché => autoradio hors tension => voiture éteinte
 PROBE_SECS=20      # durée max de la sonde OBD de confirmation
 COOLDOWN=300       # s sans ping Vgate après un faux réveil
@@ -125,7 +152,7 @@ vbus_state() {
 
 # Le gadget USB est-il attaché au contrôleur ? Sert à ne pas tuer aa-proxy-rs pendant qu'il le
 # construit au démarrage.
-gadget_bound() { [ -n "$(cat /sys/kernel/config/usb_gadget/accessory/UDC 2>/dev/null)" ]; }
+gadget_bound() { [ -n "$(cat "$GADGET_UDC" 2>/dev/null)" ]; }
 
 vgate_reachable() { l2ping -c 1 -t 2 "$VGATE" >/dev/null 2>&1; }
 
@@ -161,6 +188,9 @@ last_usb_ok=$now
 start_ts=$now
 usb_dropped=0
 veille_ts=$now
+# 0 = on n'a pas encore fait de réveil. MIN_ACTIF ne s'applique qu'APRÈS un réveil, jamais au
+# démarrage : sinon la veille initiale (le cas principal) serait retardée de 41 s à 131 s.
+actif_ts=0
 cooldown_until=0
 last_hb=$now
 vg=inconnu
@@ -168,7 +198,7 @@ vg=inconnu
 # Filet : quoi qu'il arrive en sortant, Android Auto redémarre.
 trap 'log "arrêt du script -> relance Android Auto"; SAVE=$MODE; MODE=reel; start_aa; MODE=$SAVE; exit 0' INT TERM
 
-log "=== démarrage aa-standby v4.2 MODE=$MODE (usb_off=${USB_OFF}s boot_grace=${BOOT_GRACE}s off_after=${OFF_AFTER}s focus_confirm=${FOCUS_CONFIRM}s probe=${PROBE_SECS}s cooldown=${COOLDOWN}s false_off=${FALSE_OFF}s)"
+log "=== démarrage aa-standby v4.3 MODE=$MODE (usb_off=${USB_OFF}s boot_grace=${BOOT_GRACE}s off_after=${OFF_AFTER}s focus_confirm=${FOCUS_CONFIRM}s probe=${PROBE_SECS}s cooldown=${COOLDOWN}s false_off=${FALSE_OFF}s min_actif=${MIN_ACTIF}s veille_max=${VEILLE_MAX}s)"
 log "chemins : udc=$UDC_STATE extcon=$EXTCON_STATE init=$INIT"
 
 if [ "$prev_udc" = configured ]; then
@@ -271,12 +301,29 @@ while true; do
             silence=$((now - last_data))
             usb_off=$((now - last_usb_ok))
             reason=""
+
+            # GARDE-FOU 2 (v4.3) : après un réveil, on s'interdit de se rendormir avant MIN_ACTIF s.
+            # Borne le va-et-vient à un stop/start par MIN_ACTIF au pire, quoi qu'il arrive ensuite
+            # dans la logique. Ne freine QUE l'endormissement — un réveil reste immédiat. Et ne
+            # s'applique pas au démarrage (actif_ts=0), donc la veille initiale reste à 41 s.
+            peut_dormir=1
+            if [ "$actif_ts" -ne 0 ] && [ $((now - actif_ts)) -lt "$MIN_ACTIF" ]; then
+                peut_dormir=0
+            fi
             # Grâce de BOOT_GRACE après le lancement : au boot l'USB met 22 à 28 s à s'attacher, on ne
             # veut pas conclure « voiture éteinte » pendant cette fenêtre.
-            if [ "$usb_off" -ge "$USB_OFF" ] && [ $((now - start_ts)) -ge "$BOOT_GRACE" ]; then
+            if [ "$usb_off" -ge "$USB_OFF" ] && [ $((now - start_ts)) -ge "$BOOT_GRACE" ] \
+               && { [ "$seen_data" -eq 0 ] || [ "$silence" -ge "$FOCUS_CONFIRM" ]; }; then
                 # Ne dépend pas de seen_data : couvre le cas d'un boîtier démarré voiture éteinte,
                 # où aucune donnée OBD n'arrive jamais et où l'ancienne logique restait ACTIF
                 # indéfiniment.
+                #
+                # GARDE-FOU 1 (v4.3) : si l'OBD parle EN CE MOMENT, la voiture n'est pas éteinte —
+                # son bus répond. On n'endort donc pas sur le seul critère USB tant que l'OBD n'a
+                # pas lui aussi cessé depuis FOCUS_CONFIRM s. C'est le même discriminant que la
+                # sonde de la règle 4 du réveil, appliqué dans l'autre sens.
+                # Si l'OBD n'a JAMAIS rien donné (seen_data=0), rien ne change : c'est le cas
+                # principal (boîtier démarré voiture éteinte, ou pas de Vgate du tout).
                 reason="USB de l'écran détaché depuis ${usb_off}s (autoradio hors tension)"
             elif [ "$seen_data" -eq 1 ] && [ "$silence" -gt "$OFF_AFTER" ]; then
                 reason="pas de données OBD depuis ${silence}s"
@@ -285,6 +332,15 @@ while true; do
                 # Si Android Auto était à l'écran (focus 1), on préfère attendre le filet lent :
                 # un OBD muet vient plus souvent d'un Vgate capricieux que d'une extinction.
                 reason="écran à la voiture + aucune donnée OBD depuis ${silence}s (détection rapide)"
+            fi
+
+            if [ -n "$reason" ] && [ "$peut_dormir" -eq 0 ]; then
+                # Journalisé une seule fois par report, sinon ça inonde le journal toutes les 2 s.
+                if [ "$report_logue" != "$actif_ts" ]; then
+                    report_logue=$actif_ts
+                    log "endormissement reporté ($reason) — réveillé depuis $((now - actif_ts))s, minimum ${MIN_ACTIF}s"
+                fi
+                reason=""
             fi
 
             if [ -n "$reason" ]; then
@@ -304,6 +360,28 @@ while true; do
             # une veille déclenchée par le focus serait annulée dans la seconde.
             [ "$u" != configured ] && usb_dropped=1
 
+            # GARDE-FOU 3 (v4.3) — HOMME MORT. Quelle que soit la raison, on ne reste pas en veille
+            # plus de VEILLE_MAX secondes d'affilée : on rallume Android Auto et on repart d'un état
+            # propre. Si la voiture est bel et bien éteinte, la règle USB rendormira le boîtier ~41 s
+            # plus tard — coût réel : environ 90 s toutes les 2 h, soit 1 % du temps.
+            # En échange, AUCUNE panne ne peut plus durer indéfiniment. La v5 (2026-09-18) avait
+            # laissé Android Auto mort 6 h 30 faute d'un filet de ce genre ; avec celui-ci elle
+            # aurait été rattrapée en 2 h, et les rallumages répétés auraient signalé le problème.
+            # Ce filet ne fait QUE rallumer Android Auto — il ne peut donc pas causer la panne
+            # qu'il est censé rattraper.
+            if [ $((now - veille_ts)) -ge "$VEILLE_MAX" ]; then
+                state=ACTIF
+                actif_ts=$now
+                last_data=$now
+                last_usb_ok=$now
+                seen_data=0
+                usb_dropped=0
+                cooldown_until=0
+                log "HOMME MORT : $((VEILLE_MAX / 60)) min de veille d'affilée -> on rallume Android Auto par sécurité"
+                SAVE=$MODE; MODE=reel; start_aa; MODE=$SAVE
+                continue
+            fi
+
             # 1) Failsafe : on s'est endormi sur un critère OBD alors que l'écran était encore
             # alimenté, et l'USB n'est jamais tombé. Donc la voiture ne s'était pas éteinte —
             # c'est le Vgate qui a lâché en roulant. On rallume plutôt que de laisser Android
@@ -314,6 +392,7 @@ while true; do
                 last_data=$now
                 last_usb_ok=$now
                 seen_data=0
+                actif_ts=$now
                 log "faux positif : USB de l'écran jamais tombé après ${FALSE_OFF}s -> ACTIF"
                 start_aa
 
@@ -323,6 +402,7 @@ while true; do
                 state=ACTIF
                 last_data=$now
                 last_usb_ok=$now
+                actif_ts=$now
                 log "USB de l'écran de nouveau attaché -> voiture rallumée -> ACTIF"
                 start_aa
 
@@ -330,6 +410,7 @@ while true; do
             elif [ "$last_data" -eq "$now" ]; then
                 state=ACTIF
                 last_usb_ok=$now
+                actif_ts=$now
                 log "données OBD de nouveau présentes -> ACTIF"
                 start_aa
 
@@ -346,6 +427,7 @@ while true; do
                         last_usb_ok=$(up)
                         seen_data=1
                         prev_data=$(data_count)
+                        actif_ts=$(up)
                         log "voiture RALLUMÉE (confirmée par l'OBD) -> ACTIF"
                         start_aa
                     else
