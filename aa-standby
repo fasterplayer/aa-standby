@@ -1,5 +1,5 @@
 #!/bin/sh
-# aa-standby v4.3 — coupe Android Auto quand la voiture est éteinte, le remet quand elle redémarre.
+# aa-standby v4.4 — coupe Android Auto quand la voiture est éteinte, le remet quand elle redémarre.
 #
 # SIGNAL PRINCIPAL : l'état du gadget USB (/sys/class/udc/.../state).
 #   Il suit l'alimentation de l'autoradio, ne dépend ni du Vgate ni du Bluetooth, et il survit à
@@ -49,6 +49,18 @@
 #        En échange, AUCUNE panne ne peut plus durer indéfiniment — la v5 du 2026-09-18 avait laissé
 #        Android Auto mort 6 h 30 faute d'un filet de ce genre. Ce filet ne fait QUE rallumer, il ne
 #        peut donc pas causer la panne qu'il rattrape.
+#
+# v4.4 (2026-09-25) — DEUX VÉTOS SUR LES RÈGLES OBD.
+#   Incident mesuré : voiture garée moteur allumé, la sonde OBD réveille le boîtier, aa-proxy-rs
+#   redémarre, mais l'OBD reste muet 90 s (le Vgate sort mal d'une sonde tuée). Le filet lent a
+#   conclu « voiture éteinte » ALORS QUE l'USB de l'autoradio était « configured ». FALSE_OFF a
+#   rattrapé 4 min plus tard — 4 min d'Android Auto mort, utilisateur au volant.
+#     1. Les DEUX règles OBD (filet lent ET détection rapide) exigent udc != configured. Un USB « configured » prouve que la
+#        voiture est allumée ; un OBD muet seul ne suffit plus à endormir dans ce cas.
+#     2. La détection rapide exige focus_seen_2 : le journal d'aa-proxy-rs n'est PAS tronqué à son
+#        redémarrage, donc focus_mode() renvoyait le mode=2 de la session précédente. Le focus
+#        n'est cru que s'il a basculé à 2 pendant la période ACTIF courante.
+#   Les deux ne font qu'EMPÊCHER un endormissement. Aucun réveil n'est touché.
 #
 # MODE : contenu de /data/aa-standby.mode -> "observation" (journalise seulement) ou "reel".
 
@@ -191,6 +203,11 @@ veille_ts=$now
 # 0 = on n'a pas encore fait de réveil. MIN_ACTIF ne s'applique qu'APRÈS un réveil, jamais au
 # démarrage : sinon la veille initiale (le cas principal) serait retardée de 41 s à 131 s.
 actif_ts=0
+# 1 = on a VU le focus passer à 2 (la voiture reprend l'écran) pendant la période ACTIF courante.
+# Le journal d'aa-proxy-rs n'est pas tronqué à son redémarrage, donc focus_mode() peut renvoyer le
+# mode=2 de la session PRÉCÉDENTE (mesuré le 2026-09-25). La détection rapide n'a le droit de se
+# fier au focus que s'il a changé sous nos yeux. Remis à 0 à chaque réveil.
+focus_seen_2=0
 cooldown_until=0
 last_hb=$now
 vg=inconnu
@@ -198,7 +215,7 @@ vg=inconnu
 # Filet : quoi qu'il arrive en sortant, Android Auto redémarre.
 trap 'log "arrêt du script -> relance Android Auto"; SAVE=$MODE; MODE=reel; start_aa; MODE=$SAVE; exit 0' INT TERM
 
-log "=== démarrage aa-standby v4.3 MODE=$MODE (usb_off=${USB_OFF}s boot_grace=${BOOT_GRACE}s off_after=${OFF_AFTER}s focus_confirm=${FOCUS_CONFIRM}s probe=${PROBE_SECS}s cooldown=${COOLDOWN}s false_off=${FALSE_OFF}s min_actif=${MIN_ACTIF}s veille_max=${VEILLE_MAX}s)"
+log "=== démarrage aa-standby v4.4 MODE=$MODE (usb_off=${USB_OFF}s boot_grace=${BOOT_GRACE}s off_after=${OFF_AFTER}s focus_confirm=${FOCUS_CONFIRM}s probe=${PROBE_SECS}s cooldown=${COOLDOWN}s false_off=${FALSE_OFF}s min_actif=${MIN_ACTIF}s veille_max=${VEILLE_MAX}s)"
 log "chemins : udc=$UDC_STATE extcon=$EXTCON_STATE init=$INIT"
 
 if [ "$prev_udc" = configured ]; then
@@ -262,7 +279,7 @@ while true; do
     if [ "$f" != "$prev_focus" ]; then
         case "$f" in
             1) log "Android Auto a repris l'écran (focus projection)" ;;
-            2) log "la voiture a repris l'écran (focus natif) — extinction, radio ou menus" ;;
+            2) focus_seen_2=1; log "la voiture a repris l'écran (focus natif) — extinction, radio ou menus" ;;
         esac
         prev_focus=$f
     fi
@@ -325,9 +342,16 @@ while true; do
                 # Si l'OBD n'a JAMAIS rien donné (seen_data=0), rien ne change : c'est le cas
                 # principal (boîtier démarré voiture éteinte, ou pas de Vgate du tout).
                 reason="USB de l'écran détaché depuis ${usb_off}s (autoradio hors tension)"
-            elif [ "$seen_data" -eq 1 ] && [ "$silence" -gt "$OFF_AFTER" ]; then
+            elif [ "$seen_data" -eq 1 ] && [ "$silence" -gt "$OFF_AFTER" ] && [ "$u" != configured ]; then
+                # VÉTO v4.4 : l'USB de l'autoradio « configured » prouve que la voiture est allumée. Un OBD
+                # muet seul (Vgate qui lâche, sonde mal sortie) ne suffit plus à endormir dans ce cas.
                 reason="pas de données OBD depuis ${silence}s"
-            elif [ "$seen_data" -eq 1 ] && [ "$f" = 2 ] && [ "$silence" -ge "$FOCUS_CONFIRM" ]; then
+            elif [ "$seen_data" -eq 1 ] && [ "$f" = 2 ] && [ "$focus_seen_2" -eq 1 ] && [ "$silence" -ge "$FOCUS_CONFIRM" ] && [ "$u" != configured ]; then
+                # VÉTO v4.4 (bis) : même avec un focus frais, un USB « configured » = voiture allumée. Le
+                # 2026-09-25 à up=1700s, radio à l'écran + Vgate muet 26 s ont coupé Android Auto 4 min,
+                # utilisateur au volant. Avec udc lisible, SEULE la règle USB a le droit d'endormir.
+                # VÉTO v4.4 : le focus doit avoir basculé à 2 PENDANT cette période ACTIF (focus_seen_2),
+                # sinon c'est la valeur périmée de la session précédente.
                 # L'écran appartient à la voiture ET l'OBD s'est tu : extinction très probable.
                 # Si Android Auto était à l'écran (focus 1), on préfère attendre le filet lent :
                 # un OBD muet vient plus souvent d'un Vgate capricieux que d'une extinction.
@@ -371,7 +395,7 @@ while true; do
             # qu'il est censé rattraper.
             if [ $((now - veille_ts)) -ge "$VEILLE_MAX" ]; then
                 state=ACTIF
-                actif_ts=$now
+                actif_ts=$now; focus_seen_2=0
                 last_data=$now
                 last_usb_ok=$now
                 seen_data=0
@@ -392,7 +416,7 @@ while true; do
                 last_data=$now
                 last_usb_ok=$now
                 seen_data=0
-                actif_ts=$now
+                actif_ts=$now; focus_seen_2=0
                 log "faux positif : USB de l'écran jamais tombé après ${FALSE_OFF}s -> ACTIF"
                 start_aa
 
@@ -402,7 +426,7 @@ while true; do
                 state=ACTIF
                 last_data=$now
                 last_usb_ok=$now
-                actif_ts=$now
+                actif_ts=$now; focus_seen_2=0
                 log "USB de l'écran de nouveau attaché -> voiture rallumée -> ACTIF"
                 start_aa
 
@@ -410,7 +434,7 @@ while true; do
             elif [ "$last_data" -eq "$now" ]; then
                 state=ACTIF
                 last_usb_ok=$now
-                actif_ts=$now
+                actif_ts=$now; focus_seen_2=0
                 log "données OBD de nouveau présentes -> ACTIF"
                 start_aa
 
@@ -427,7 +451,7 @@ while true; do
                         last_usb_ok=$(up)
                         seen_data=1
                         prev_data=$(data_count)
-                        actif_ts=$(up)
+                        actif_ts=$(up); focus_seen_2=0
                         log "voiture RALLUMÉE (confirmée par l'OBD) -> ACTIF"
                         start_aa
                     else

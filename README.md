@@ -6,7 +6,7 @@ kernel already publishes. **No GPIO, no resistors, no cut USB cable, no extra ha
 > **Tested on:** Hyundai Kona EV 2021 with a Gen5W head unit (Mobis `standard_m_5`, software
 > `V014.010.250818`, Android Auto protocol 1.4), running on an AAWireless Two. One car, one board —
 > see [Status and caveats](#status-and-caveats). **v4.3 is in production** on that car since
-> 2026-09-21: ignition off → Android Auto stopped in 23 s; restart → Android Auto on screen in 32 s.
+> 2026-09-21 (v4.4 since 2026-09-25): ignition off → Android Auto stopped in 23 s; restart → Android Auto on screen in 32 s.
 
 Companion script for [aa-proxy-rs](https://github.com/aa-proxy/aa-proxy-rs). Plain POSIX shell,
 runs on BusyBox.
@@ -122,6 +122,11 @@ Android Auto down:
 - **the USB rule will not sleep while OBD data is flowing** (v4.3). Live OBD means the car's bus is
   up, so it is not off — even if the head unit has not enumerated yet. Without an OBD dongle this
   guard is simply never reached and the behaviour is identical to v4.2
+- **while `udc` is `configured`, only the USB rule may sleep** (v4.4). Both OBD rules carry
+  `udc != configured`. A configured host is proof the car is on; OBD silence alone (a flaky dongle,
+  a probe that left the dongle in a bad state) is not proof it is off. The fast path also requires
+  the focus change to have been *observed* during the current awake period — `aa-proxy-rs` does not
+  truncate its log on restart, so the last `VIDEO_FOCUS` line can belong to the previous session
 - **`MIN_ACTIF`** (v4.3): after any wake, no new sleep for 90 s. Bounds any flip-flop to one
   stop/start per 90 s. Does not apply at boot, so the initial sleep still happens at ~41 s
 - **`VEILLE_MAX` dead-man switch** (v4.3): after 2 h of continuous standby Android Auto is restarted
@@ -146,6 +151,25 @@ up=92s   WAKE ...                          five cycles in three minutes
 In real mode that is five `stop`/`start` cycles of `aa-proxy-rs` in three minutes — exactly the kind
 of churn that can leave the USB gadget unbound. The "don't sleep while OBD talks" guard removes the
 cause; `MIN_ACTIF` bounds the damage if anything similar ever reappears.
+
+### The false sleep fixed in v4.4
+
+Four days of real mode exposed the mirror image: parked with the engine on, the OBD dongle went
+quiet for a while (it does), and the OBD-based rules concluded "car off" **while `udc` was
+`configured`**. Android Auto was stopped for four minutes, twice in one day, with the driver in the
+seat, until `FALSE_OFF` caught it:
+
+```
+up=1678s  head unit took the screen (radio)
+up=1700s  SLEEP (screen with car + no OBD data for 26 s)   <- udc=configured the whole time
+up=1941s  false positive: USB never dropped after 240 s -> WAKE
+```
+
+So: OBD silence is not evidence the car is off when the USB host says otherwise. With `udc`
+readable, **the USB rule is the only thing that puts the board to sleep**; the OBD rules remain as a
+fallback for boards where `udc` cannot be read. The cost is on the other side: head units that keep
+the USB host alive for a while after ignition-off (up to ~169 s measured here) now delay the sleep
+by that much. Android Auto working while the car is on wins that trade.
 
 **Without an OBD dongle everything still works.** No OBD data ever arrives, so every OBD rule stays
 inert and only the USB rule acts.
@@ -248,6 +272,10 @@ your real Bluetooth adapter), and replays timelines taken from real logs:
 - **Test A** replays the flip-flop scenario above and asserts the script stays awake while OBD talks
 - **Test B** lowers `VEILLE_MAX` to 60 s and asserts the dead-man fires, `MIN_ACTIF` delays the
   re-sleep, and the exit trap restarts Android Auto
+- **Test C** replays the v4.4 false sleep (USB configured, one OBD packet then silence, a stale
+  focus line, then a real focus change) and asserts no sleep until the USB actually detaches
+
+`ESSAIS="C"` runs a subset.
 
 ```sh
 scp aa-standby test-aa-standby.sh root@<board>:/tmp/
